@@ -50,12 +50,7 @@ import {canUseDOM} from 'shared/ExecutionEnvironment';
 import ReactVersion from 'shared/ReactVersion';
 import {enableNewReconciler} from 'shared/ReactFeatureFlags';
 
-import {
-  getInstanceFromNode,
-  getNodeFromInstance,
-  getFiberCurrentPropsFromNode,
-  getClosestInstanceFromNode,
-} from './ReactDOMComponentTree';
+import {getClosestInstanceFromNode} from './ReactDOMComponentTree';
 import {restoreControlledState} from './ReactDOMComponent';
 import {
   setAttemptSynchronousHydration,
@@ -66,11 +61,8 @@ import {
   setAttemptHydrationAtPriority,
 } from '../events/ReactDOMEventReplaying';
 import {setBatchingImplementation} from '../events/ReactDOMUpdateBatching';
-import {
-  setRestoreImplementation,
-  enqueueStateRestore,
-  restoreStateIfNeeded,
-} from '../events/ReactDOMControlledComponent';
+import {setRestoreImplementation} from '../events/ReactDOMControlledComponent';
+import Internals from '../ReactDOMSharedInternals';
 
 setAttemptSynchronousHydration(attemptSynchronousHydration);
 setAttemptDiscreteHydration(attemptDiscreteHydration);
@@ -82,11 +74,11 @@ setAttemptHydrationAtPriority(runWithPriority);
 if (__DEV__) {
   if (
     typeof Map !== 'function' ||
-    // $FlowIssue Flow incorrectly thinks Map has no prototype
+    // $FlowFixMe Flow incorrectly thinks Map has no prototype
     Map.prototype == null ||
     typeof Map.prototype.forEach !== 'function' ||
     typeof Set !== 'function' ||
-    // $FlowIssue Flow incorrectly thinks Set has no prototype
+    // $FlowFixMe Flow incorrectly thinks Set has no prototype
     Set.prototype == null ||
     typeof Set.prototype.clear !== 'function' ||
     typeof Set.prototype.forEach !== 'function'
@@ -132,20 +124,6 @@ function renderSubtreeIntoContainer(
     callback,
   );
 }
-
-const Internals = {
-  usingClientEntryPoint: false,
-  // Keep in sync with ReactTestUtils.js.
-  // This is an array for better minification.
-  Events: [
-    getInstanceFromNode,
-    getNodeFromInstance,
-    getFiberCurrentPropsFromNode,
-    enqueueStateRestore,
-    restoreStateIfNeeded,
-    batchedUpdates,
-  ],
-};
 
 function createRoot(
   container: Element | Document | DocumentFragment,
@@ -201,7 +179,6 @@ export {
   createPortal,
   batchedUpdates as unstable_batchedUpdates,
   flushSync,
-  Internals as __SECRET_INTERNALS_DO_NOT_USE_OR_YOU_WILL_BE_FIRED,
   ReactVersion as version,
   // Disabled behind disableLegacyReactDOMAPIs
   findDOMNode,

@@ -28,6 +28,8 @@ export function act<T>(scope: () => Thenable<T> | T): Thenable<T> {
       'This version of `act` requires a special mock build of Scheduler.',
     );
   }
+
+  // $FlowFixMe: _isMockFunction doesn't exist on function
   if (setTimeout._isMockFunction !== true) {
     throw Error(
       "This version of `act` requires Jest's timer mocks " +
@@ -137,7 +139,7 @@ function flushActWork(resolve, reject) {
   // Once the scheduler queue is empty, run all the timers. The purpose of this
   // is to force any pending fallbacks to commit. The public version of act does
   // this with dev-only React runtime logic, but since our internal act needs to
-  // work work production builds of React, we have to cheat.
+  // work production builds of React, we have to cheat.
   // $FlowFixMe: Flow doesn't know about global Jest object
   jest.runOnlyPendingTimers();
   if (Scheduler.unstable_hasPendingWork()) {

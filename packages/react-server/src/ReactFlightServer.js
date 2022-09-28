@@ -16,9 +16,11 @@ import type {
   ModuleKey,
 } from './ReactFlightServerConfig';
 import type {ContextSnapshot} from './ReactFlightNewContext';
+import type {ThenableState} from './ReactFlightWakeable';
 import type {
   ReactProviderType,
   ServerContextJSONValue,
+  Wakeable,
 } from 'shared/ReactTypes';
 
 import {
@@ -33,7 +35,8 @@ import {
   processModuleChunk,
   processProviderChunk,
   processSymbolChunk,
-  processErrorChunk,
+  processErrorChunkProd,
+  processErrorChunkDev,
   processReferenceChunk,
   resolveModuleMetaData,
   getModuleKey,
@@ -44,6 +47,8 @@ import {
   Dispatcher,
   getCurrentCache,
   prepareToUseHooksForRequest,
+  prepareToUseHooksForComponent,
+  getThenableStateAfterSuspending,
   resetHooksForRequest,
   setCurrentCache,
 } from './ReactFlightHooks';
@@ -54,6 +59,7 @@ import {
   getActiveContext,
   rootContextSnapshot,
 } from './ReactFlightNewContext';
+import {trackSuspendedWakeable} from './ReactFlightWakeable';
 
 import {
   REACT_ELEMENT_TYPE,
@@ -81,6 +87,7 @@ export type ReactModel =
   | string
   | boolean
   | number
+  | symbol
   | null
   | Iterable<ReactModel>
   | ReactModelObject;
@@ -98,6 +105,7 @@ type Task = {
   model: ReactModel,
   ping: () => void,
   context: ContextSnapshot,
+  thenableState: ThenableState | null,
 };
 
 export type Request = {
@@ -113,12 +121,12 @@ export type Request = {
   completedModuleChunks: Array<Chunk>,
   completedJSONChunks: Array<Chunk>,
   completedErrorChunks: Array<Chunk>,
-  writtenSymbols: Map<Symbol, number>,
+  writtenSymbols: Map<symbol, number>,
   writtenModules: Map<ModuleKey, number>,
   writtenProviders: Map<string, number>,
   identifierPrefix: string,
   identifierCount: number,
-  onError: (error: mixed) => void,
+  onError: (error: mixed) => ?string,
   toJSON: (key: string, value: ReactModel) => ReactJSONValue,
 };
 
@@ -136,7 +144,7 @@ const CLOSED = 2;
 export function createRequest(
   model: ReactModel,
   bundlerConfig: BundlerConfig,
-  onError: void | ((error: mixed) => void),
+  onError: void | ((error: mixed) => ?string),
   context?: Array<[string, ServerContextJSONValue]>,
   identifierPrefix?: string,
 ): Request {
@@ -185,6 +193,7 @@ function attemptResolveElement(
   key: null | React$Key,
   ref: mixed,
   props: any,
+  prevThenableState: ThenableState | null,
 ): ReactModel {
   if (ref !== null && ref !== undefined) {
     // When the ref moves to the regular props object this will implicitly
@@ -200,6 +209,7 @@ function attemptResolveElement(
       return [REACT_ELEMENT_TYPE, type, key, props];
     }
     // This is a server-side component.
+    prepareToUseHooksForComponent(prevThenableState);
     return type(props);
   } else if (typeof type === 'string') {
     // This is a host element. E.g. HTML.
@@ -225,14 +235,27 @@ function attemptResolveElement(
         const payload = type._payload;
         const init = type._init;
         const wrappedType = init(payload);
-        return attemptResolveElement(wrappedType, key, ref, props);
+        return attemptResolveElement(
+          wrappedType,
+          key,
+          ref,
+          props,
+          prevThenableState,
+        );
       }
       case REACT_FORWARD_REF_TYPE: {
         const render = type.render;
+        prepareToUseHooksForComponent(prevThenableState);
         return render(props, undefined);
       }
       case REACT_MEMO_TYPE: {
-        return attemptResolveElement(type.type, key, ref, props);
+        return attemptResolveElement(
+          type.type,
+          key,
+          ref,
+          props,
+          prevThenableState,
+        );
       }
       case REACT_PROVIDER_TYPE: {
         pushProvider(type._context, props.value);
@@ -250,6 +273,7 @@ function attemptResolveElement(
             );
           }
         }
+        // $FlowFixMe issue discovered when updating Flow
         return [
           REACT_ELEMENT_TYPE,
           type,
@@ -286,6 +310,7 @@ function createTask(
     model,
     context,
     ping: () => pingTask(request, task),
+    thenableState: null,
   };
   abortSet.add(task);
   return task;
@@ -340,7 +365,13 @@ function serializeModuleReference(
   } catch (x) {
     request.pendingChunks++;
     const errorId = request.nextChunkId++;
-    emitErrorChunk(request, errorId, x);
+    const digest = logRecoverableError(request, x);
+    if (__DEV__) {
+      const {message, stack} = getErrorMessageAndStackDev(x);
+      emitErrorChunkDev(request, errorId, digest, message, stack);
+    } else {
+      emitErrorChunkProd(request, errorId, digest);
+    }
     return serializeByValueID(errorId);
   }
 }
@@ -442,7 +473,7 @@ function describeValueForErrorMessage(value: ReactModel): string {
 
 function describeObjectForErrorMessage(
   objectOrArray:
-    | {+[key: string | number]: ReactModel}
+    | {+[key: string | number]: ReactModel, ...}
     | $ReadOnlyArray<ReactModel>,
   expandedName?: string,
 ): string {
@@ -472,7 +503,7 @@ function describeObjectForErrorMessage(
     return str;
   } else {
     let str = '{';
-    const object: {+[key: string | number]: ReactModel} = objectOrArray;
+    const object: {+[key: string | number]: ReactModel, ...} = objectOrArray;
     const names = Object.keys(object);
     for (let i = 0; i < names.length; i++) {
       if (i > 0) {
@@ -569,6 +600,7 @@ export function resolveModelToJSON(
             element.key,
             element.ref,
             element.props,
+            null,
           );
           break;
         }
@@ -591,6 +623,11 @@ export function resolveModelToJSON(
         );
         const ping = newTask.ping;
         x.then(ping, ping);
+
+        const wakeable: Wakeable = x;
+        trackSuspendedWakeable(wakeable);
+        newTask.thenableState = getThenableStateAfterSuspending();
+
         return serializeByRefID(newTask.id);
       } else {
         logRecoverableError(request, x);
@@ -599,7 +636,13 @@ export function resolveModelToJSON(
         // once it gets rendered.
         request.pendingChunks++;
         const errorId = request.nextChunkId++;
-        emitErrorChunk(request, errorId, x);
+        const digest = logRecoverableError(request, x);
+        if (__DEV__) {
+          const {message, stack} = getErrorMessageAndStackDev(x);
+          emitErrorChunkDev(request, errorId, digest, message, stack);
+        } else {
+          emitErrorChunkProd(request, errorId, digest);
+        }
         return serializeByRefID(errorId);
       }
     }
@@ -669,6 +712,7 @@ export function resolveModelToJSON(
       }
     }
 
+    // $FlowFixMe
     return value;
   }
 
@@ -718,12 +762,17 @@ export function resolveModelToJSON(
     if (existingId !== undefined) {
       return serializeByValueID(existingId);
     }
-    const name = value.description;
+    // $FlowFixMe `description` might be undefined
+    const name: string = value.description;
 
+    // $FlowFixMe `name` might be undefined
     if (Symbol.for(name) !== value) {
       throw new Error(
         'Only global symbols received from Symbol.for(...) can be passed to client components. ' +
-          `The symbol Symbol.for(${value.description}) cannot be found among global symbols. ` +
+          `The symbol Symbol.for(${
+            // $FlowFixMe `description` might be undefined
+            value.description
+          }) cannot be found among global symbols. ` +
           `Remove ${describeKeyForErrorMessage(
             key,
           )} from this object, or avoid the entire object: ${describeObjectForErrorMessage(
@@ -761,9 +810,47 @@ export function resolveModelToJSON(
   );
 }
 
-function logRecoverableError(request: Request, error: mixed): void {
+function logRecoverableError(request: Request, error: mixed): string {
   const onError = request.onError;
-  onError(error);
+  const errorDigest = onError(error);
+  if (errorDigest != null && typeof errorDigest !== 'string') {
+    // eslint-disable-next-line react-internal/prod-error-codes
+    throw new Error(
+      `onError returned something with a type other than "string". onError should return a string and may return null or undefined but must not return anything else. It received something of type "${typeof errorDigest}" instead`,
+    );
+  }
+  return errorDigest || '';
+}
+
+function getErrorMessageAndStackDev(
+  error: mixed,
+): {message: string, stack: string} {
+  if (__DEV__) {
+    let message;
+    let stack = '';
+    try {
+      if (error instanceof Error) {
+        // eslint-disable-next-line react-internal/safe-string-coercion
+        message = String(error.message);
+        // eslint-disable-next-line react-internal/safe-string-coercion
+        stack = String(error.stack);
+      } else {
+        message = 'Error: ' + (error: any);
+      }
+    } catch (x) {
+      message = 'An error occurred but serializing the error message failed.';
+    }
+    return {
+      message,
+      stack,
+    };
+  } else {
+    // These errors should never make it into a build so we don't need to encode them in codes.json
+    // eslint-disable-next-line react-internal/prod-error-codes
+    throw new Error(
+      'getErrorMessageAndStackDev should never be called from production mode. This is a bug in React.',
+    );
+  }
 }
 
 function fatalError(request: Request, error: mixed): void {
@@ -777,26 +864,29 @@ function fatalError(request: Request, error: mixed): void {
   }
 }
 
-function emitErrorChunk(request: Request, id: number, error: mixed): void {
-  // TODO: We should not leak error messages to the client in prod.
-  // Give this an error code instead and log on the server.
-  // We can serialize the error in DEV as a convenience.
-  let message;
-  let stack = '';
-  try {
-    if (error instanceof Error) {
-      // eslint-disable-next-line react-internal/safe-string-coercion
-      message = String(error.message);
-      // eslint-disable-next-line react-internal/safe-string-coercion
-      stack = String(error.stack);
-    } else {
-      message = 'Error: ' + (error: any);
-    }
-  } catch (x) {
-    message = 'An error occurred but serializing the error message failed.';
-  }
+function emitErrorChunkProd(
+  request: Request,
+  id: number,
+  digest: string,
+): void {
+  const processedChunk = processErrorChunkProd(request, id, digest);
+  request.completedErrorChunks.push(processedChunk);
+}
 
-  const processedChunk = processErrorChunk(request, id, message, stack);
+function emitErrorChunkDev(
+  request: Request,
+  id: number,
+  digest: string,
+  message: string,
+  stack: string,
+): void {
+  const processedChunk = processErrorChunkDev(
+    request,
+    id,
+    digest,
+    message,
+    stack,
+  );
   request.completedErrorChunks.push(processedChunk);
 }
 
@@ -805,6 +895,7 @@ function emitModuleChunk(
   id: number,
   moduleMetaData: ModuleMetaData,
 ): void {
+  // $FlowFixMe ModuleMetaData is not a ReactModel
   const processedChunk = processModuleChunk(request, id, moduleMetaData);
   request.completedModuleChunks.push(processedChunk);
 }
@@ -828,16 +919,22 @@ function retryTask(request: Request, task: Task): void {
     // We completed this by other means before we had a chance to retry it.
     return;
   }
+
   switchContext(task.context);
   try {
     let value = task.model;
-    while (
+    if (
       typeof value === 'object' &&
       value !== null &&
       (value: any).$$typeof === REACT_ELEMENT_TYPE
     ) {
       // TODO: Concatenate keys of parents onto children.
       const element: React$Element<any> = (value: any);
+
+      // When retrying a component, reuse the thenableState from the
+      // previous attempt.
+      const prevThenableState = task.thenableState;
+
       // Attempt to render the server component.
       // Doing this here lets us reuse this same task if the next component
       // also suspends.
@@ -847,8 +944,34 @@ function retryTask(request: Request, task: Task): void {
         element.key,
         element.ref,
         element.props,
+        prevThenableState,
       );
+
+      // Successfully finished this component. We're going to keep rendering
+      // using the same task, but we reset its thenable state before continuing.
+      task.thenableState = null;
+
+      // Keep rendering and reuse the same task. This inner loop is separate
+      // from the render above because we don't need to reset the thenable state
+      // until the next time something suspends and retries.
+      while (
+        typeof value === 'object' &&
+        value !== null &&
+        (value: any).$$typeof === REACT_ELEMENT_TYPE
+      ) {
+        // TODO: Concatenate keys of parents onto children.
+        const nextElement: React$Element<any> = (value: any);
+        task.model = value;
+        value = attemptResolveElement(
+          nextElement.type,
+          nextElement.key,
+          nextElement.ref,
+          nextElement.props,
+          null,
+        );
+      }
     }
+
     const processedChunk = processModelChunk(request, task.id, value);
     request.completedJSONChunks.push(processedChunk);
     request.abortableTasks.delete(task);
@@ -858,13 +981,21 @@ function retryTask(request: Request, task: Task): void {
       // Something suspended again, let's pick it back up later.
       const ping = task.ping;
       x.then(ping, ping);
+
+      const wakeable: Wakeable = x;
+      trackSuspendedWakeable(wakeable);
+      task.thenableState = getThenableStateAfterSuspending();
       return;
     } else {
       request.abortableTasks.delete(task);
       task.status = ERRORED;
-      logRecoverableError(request, x);
-      // This errored, we need to serialize this error to the
-      emitErrorChunk(request, task.id, x);
+      const digest = logRecoverableError(request, x);
+      if (__DEV__) {
+        const {message, stack} = getErrorMessageAndStackDev(x);
+        emitErrorChunkDev(request, task.id, digest, message, stack);
+      } else {
+        emitErrorChunkProd(request, task.id, digest);
+      }
     }
   }
 }
@@ -902,7 +1033,7 @@ function abortTask(task: Task, request: Request, errorId: number): void {
   // has a single value referencing the error.
   const ref = serializeByValueID(errorId);
   const processedChunk = processReferenceChunk(request, task.id, ref);
-  request.completedJSONChunks.push(processedChunk);
+  request.completedErrorChunks.push(processedChunk);
 }
 
 function flushCompletedChunks(
@@ -1004,10 +1135,15 @@ export function abort(request: Request, reason: mixed): void {
           ? new Error('The render was aborted by the server without a reason.')
           : reason;
 
-      logRecoverableError(request, error);
+      const digest = logRecoverableError(request, error);
       request.pendingChunks++;
       const errorId = request.nextChunkId++;
-      emitErrorChunk(request, errorId, error);
+      if (__DEV__) {
+        const {message, stack} = getErrorMessageAndStackDev(error);
+        emitErrorChunkDev(request, errorId, digest, message, stack);
+      } else {
+        emitErrorChunkProd(request, errorId, digest);
+      }
       abortableTasks.forEach(task => abortTask(task, request, errorId));
       abortableTasks.clear();
     }
